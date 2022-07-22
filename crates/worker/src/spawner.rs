@@ -6,7 +6,7 @@ use std::rc::{Rc, Weak};
 
 use gloo_utils::window;
 use js_sys::Array;
-use web_sys::{Blob, BlobPropertyBag, Url};
+use web_sys::{Blob, BlobPropertyBag, Url, WorkerOptions};
 
 use crate::bridge::{CallbackMap, WorkerBridge};
 use crate::codec::{Bincode, Codec};
@@ -125,6 +125,61 @@ where
             let pending_queue = pending_queue.clone();
             let callbacks = callbacks.clone();
             let worker = create_worker(path);
+
+            let handler = {
+                let worker = worker.clone();
+
+                move |msg: FromWorker<W>| match msg {
+                    FromWorker::WorkerLoaded => {
+                        if let Some(pending_queue) = pending_queue.borrow_mut().take() {
+                            for to_worker in pending_queue.into_iter() {
+                                worker.post_packed_message::<_, CODEC>(to_worker);
+                            }
+                        }
+                    }
+                    FromWorker::ProcessOutput(id, output) => {
+                        let mut callbacks = callbacks.borrow_mut();
+
+                        if let Some(m) = callbacks.get(&id) {
+                            if let Some(m) = Weak::upgrade(m) {
+                                m(output);
+                            } else {
+                                callbacks.remove(&id);
+                            }
+                        }
+                    }
+                }
+            };
+
+            worker.set_on_packed_message::<_, CODEC, _>(handler);
+            worker
+        };
+
+        WorkerBridge::<W>::new::<CODEC>(
+            handler_id,
+            worker,
+            pending_queue,
+            callbacks,
+            self.callback.clone(),
+        )
+    }
+
+    /// Spawns a Worker with the supplied options. Expects a .js file as `path`.
+    pub fn spawn_with_options_and_js_file(&self, path: &str, options: &WorkerOptions) -> WorkerBridge<W> {
+        let pending_queue = Rc::new(RefCell::new(Some(Vec::new())));
+        let handler_id = HandlerId::new();
+        let mut callbacks = HashMap::new();
+
+        if let Some(m) = self.callback.as_ref().map(Rc::downgrade) {
+            callbacks.insert(handler_id, m);
+        }
+
+        let callbacks: Shared<CallbackMap<W>> = Rc::new(RefCell::new(callbacks));
+
+        let worker = {
+            let pending_queue = pending_queue.clone();
+            let callbacks = callbacks.clone();
+            let worker = DedicatedWorker::new_with_options(path, options).expect("failed to spawn worker");
 
             let handler = {
                 let worker = worker.clone();
